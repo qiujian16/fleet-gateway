@@ -21,11 +21,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/qiujian16/fleet-gateway/pkg/api"
 	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
@@ -35,16 +35,6 @@ import (
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
-
-type ResourceInfo struct {
-	Name         string
-	Singular     string
-	Kind         string
-	Group        string
-	Scope        apiextensionsv1.ResourceScope
-	Versions     []string
-	SubResources sets.Set[string]
-}
 
 type DiscoveryController struct {
 	versionHandler  *versionDiscoveryHandler
@@ -86,7 +76,7 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 	versionsForDiscoveryMap := map[metav1.GroupVersion]bool{}
 
 	// read resourceinfors from search
-	resourceInfos := []ResourceInfo{}
+	resourceInfos := []api.ResourceInfo{}
 
 	foundVersion := false
 	foundGroup := false
@@ -96,11 +86,11 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 			// If there is any Served version, that means the group should show up in discovery
 			foundGroup = true
 
-			gv := metav1.GroupVersion{Group: resource.Group, Version: v}
+			gv := metav1.GroupVersion{Group: resource.GVR.Group, Version: v}
 			if !versionsForDiscoveryMap[gv] {
 				versionsForDiscoveryMap[gv] = true
 				apiVersionsForDiscovery = append(apiVersionsForDiscovery, metav1.GroupVersionForDiscovery{
-					GroupVersion: resource.Group + "/" + v,
+					GroupVersion: resource.GVR.Group + "/" + v,
 					Version:      v,
 				})
 			}
@@ -117,7 +107,7 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 		verbs := metav1.Verbs([]string{"delete", "deletecollection", "get", "list", "patch", "create", "update"})
 
 		apiResourcesForDiscovery = append(apiResourcesForDiscovery, metav1.APIResource{
-			Name:         resource.Name,
+			Name:         resource.GVR.Resource,
 			SingularName: resource.Singular,
 			Namespaced:   resource.Scope == apiextensionsv1.NamespaceScoped,
 			Kind:         resource.Kind,
@@ -132,7 +122,7 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 				scope = apidiscoveryv2.ScopeCluster
 			}
 			apiResourceDiscovery := apidiscoveryv2.APIResourceDiscovery{
-				Resource:         resource.Name,
+				Resource:         resource.GVR.Resource,
 				SingularResource: resource.Singular,
 				Scope:            scope,
 				ResponseKind: &metav1.GroupVersionKind{
@@ -158,7 +148,7 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 
 		if resource.SubResources.Has("status") {
 			apiResourcesForDiscovery = append(apiResourcesForDiscovery, metav1.APIResource{
-				Name:       resource.Name + "/status",
+				Name:       resource.GVR.Resource + "/status",
 				Namespaced: resource.Scope == apiextensionsv1.NamespaceScoped,
 				Kind:       resource.Kind,
 				Verbs:      []string{"get", "patch", "update"},
