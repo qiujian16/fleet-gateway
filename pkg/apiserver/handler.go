@@ -19,12 +19,14 @@ package apiserver
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	fleetresource "github.com/qiujian16/fleet-gateway/pkg/registry/resource"
+	"github.com/qiujian16/fleet-gateway/pkg/request"
 	"github.com/qiujian16/fleet-gateway/pkg/resourcescheme"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
@@ -149,7 +151,27 @@ var longRunningFilter = genericfilters.BasicLongRunningRequestCheck(sets.NewStri
 var possiblyAcrossAllNamespacesVerbs = sets.NewString("list", "watch")
 
 func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	path, newURL, found, err := ClusterPathFromAndStrip(req)
+	if err != nil {
+		responsewriters.ErrorNegotiated(
+			apierrors.NewBadRequest(err.Error()),
+			Codecs, schema.GroupVersion{}, w, req,
+		)
+		return
+	}
+	if found {
+		req.URL = newURL
+	}
+
+	var cluster request.Cluster
+	if len(path) == 0 {
+		// HACK: just a workaround for testing
+		cluster.Wildcard = true
+	} else {
+		cluster.Name = path
+	}
+
+	ctx := request.WithCluster(req.Context(), cluster)
 	requestInfo, ok := apirequest.RequestInfoFrom(ctx)
 	if !ok {
 		responsewriters.ErrorNegotiated(
@@ -179,7 +201,6 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	//TODO get resource info from search
 
 	// resourceName := requestInfo.Resource + "." + requestInfo.APIGroup
-	var err error
 	info := &resourceInfo{}
 
 	if apierrors.IsNotFound(err) {
@@ -192,18 +213,6 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
 			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
 		)
-		return
-	}
-
-	// if the scope in the CRD and the scope in request differ (with exception of the verbs in possiblyAcrossAllNamespacesVerbs
-	// for namespaced resources), pass request to the delegate, which is supposed to lead to a 404.
-	namespacedCRD, namespacedReq := info.Scope == apiextensionsv1.NamespaceScoped, len(requestInfo.Namespace) > 0
-	if !namespacedCRD && namespacedReq {
-		r.delegate.ServeHTTP(w, req)
-		return
-	}
-	if namespacedCRD && !namespacedReq && !possiblyAcrossAllNamespacesVerbs.Has(requestInfo.Verb) {
-		r.delegate.ServeHTTP(w, req)
 		return
 	}
 
@@ -247,7 +256,7 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if handlerFunc != nil {
 		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, false, "", handlerFunc)
 		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, resourceInfo.waitGroup)
-		handler.ServeHTTP(w, req)
+		handler.ServeHTTP(w, req.WithContext(ctx))
 		return
 	}
 }
@@ -787,4 +796,27 @@ func (v *unstructuredSchemaCoercer) apply(u *unstructured.Unstructured) (unknown
 	}
 
 	return unknownFieldPaths, nil
+}
+
+// ClusterPathFromAndStrip parses the request for a logical cluster path, returns it if found
+// and strips it from the request URL path.
+func ClusterPathFromAndStrip(req *http.Request) (string, *url.URL, bool, error) {
+	if reqPath := req.URL.Path; strings.HasPrefix(reqPath, "/clusters/") {
+		reqPath = strings.TrimPrefix(reqPath, "/clusters/")
+
+		i := strings.Index(reqPath, "/")
+		if i == -1 {
+			reqPath += "/"
+			i = len(reqPath) - 1
+		}
+		path, reqPath := reqPath[:i], reqPath[i:]
+		req.URL.Path = reqPath
+		newURL, err := url.Parse(req.URL.String())
+		if err != nil {
+			return "", nil, false, fmt.Errorf("unable to resolve %s, err %w", req.URL.Path, err)
+		}
+		return path, newURL, true, nil
+	}
+
+	return "", req.URL, false, nil
 }

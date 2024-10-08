@@ -12,6 +12,8 @@ import (
 type Client interface {
 	List(ctx context.Context, gvr schema.GroupVersionResource, listOptions metav1.ListOptions) (runtime.Object, error)
 
+	GetResourceCluster(ctx context.Context, gvr schema.GroupVersionResource, name string) (string, error)
+
 	Resources() []api.ResourceInfo
 
 	ResoursesFor(name string) api.ResourceInfo
