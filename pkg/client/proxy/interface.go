@@ -1,31 +1,26 @@
 package proxy
 
 import (
-	"context"
+	"crypto/tls"
 	"fmt"
-	"net"
-	"strconv"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"time"
 
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy/options"
-	"github.com/stolostron/cluster-proxy-addon/pkg/constant"
-	"google.golang.org/grpc"
-	grpccredentials "google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/tools/clientcmd"
-	clusterproxyutil "open-cluster-management.io/cluster-proxy/pkg/util"
-	konnectivity "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
-	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 )
 
 type Client interface {
-	DynamicClient(ctx context.Context, cluster string) (dynamic.Interface, error)
+	DynamicClient(cluster string) (dynamic.Interface, error)
+	Proxy(cluster string) (*httputil.ReverseProxy, error)
 }
 
 type proxyClient struct {
-	options   *options.ProxyOption
-	getTunnel func(context.Context) (konnectivity.Tunnel, error)
+	options *options.ProxyOption
 }
 
 func NewClient(o *options.ProxyOption) Client {
@@ -38,40 +33,45 @@ func newClient(o *options.ProxyOption) *proxyClient {
 	}
 }
 
-func (p *proxyClient) DynamicClient(ctx context.Context, cluster string) (dynamic.Interface, error) {
-	proxyTLSCfg, err := util.GetClientTLSConfig(p.options.ProxyCACertPath, p.options.ProxyCertPath, p.options.ProxyKeyPath, p.options.ProxyServerHost)
-	if err != nil {
-		return nil, err
+func (p *proxyClient) DynamicClient(cluster string) (dynamic.Interface, error) {
+	cfg := &rest.Config{
+		// The `ProxyServiceHost` normally is the service domain name of the cluster-proxy-addon user-server:
+		// cluster-proxy-addon-user.<component namespace>.svc:9092
+		Host: fmt.Sprintf("https://%s/%s", p.options.ProxyServerHost, cluster),
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure: true,
+		},
+		// TODO add authentication part
+		//BearerToken: string(logTokenSecret.Data["token"]),
 	}
-
-	tunnel, err := konnectivity.CreateSingleUseGrpcTunnelWithContext(
-		context.Background(),
-		ctx,
-		net.JoinHostPort(p.options.ProxyServerHost, strconv.Itoa(p.options.ProxyServerPort)),
-		grpc.WithTransportCredentials(grpccredentials.NewTLS(proxyTLSCfg)),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time: time.Second * 5,
-		}),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg, err := clientcmd.BuildConfigFromFlags("", "")
-	if err != nil {
-		return nil, err
-	}
-	// The managed cluster's name.
-	host := fmt.Sprintf("https://%s:%d", clusterproxyutil.GenerateServiceURL(
-		cluster, "open-cluster-management-agent-addon", constant.ServiceProxyName), constant.ServiceProxyPort)
-
-	cfg.Host = host
-	cfg.Insecure = true
-	// Override the default tcp dialer
-	cfg.Dial = tunnel.DialContext
-
-	// TODO add authentication part
 
 	client, err := dynamic.NewForConfig(cfg)
 	return client, err
+}
+
+func (p *proxyClient) Proxy(cluster string) (*httputil.ReverseProxy, error) {
+	targetURL, err := url.Parse(fmt.Sprintf("https://%s/%s", p.options.ProxyServerHost, cluster))
+	if err != nil {
+		return nil, err
+	}
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		// golang http pkg automaticly upgrade http connection to http2 connection, but http2 can not upgrade to SPDY which used in "kubectl exec".
+		// set ForceAttemptHTTP2 = false to prevent auto http2 upgration
+		ForceAttemptHTTP2: false,
+	}
+
+	proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, e error) {
+		http.Error(rw, fmt.Sprintf("proxy to anp-proxy-server failed because %v", e), http.StatusBadGateway)
+		klog.Errorf("proxy to anp-proxy-server failed because %v", e)
+	}
+
+	return proxy, nil
 }

@@ -40,10 +40,10 @@ type ResourceStorage struct {
 	Status   *StatusREST
 }
 
-func NewStorage(resource schema.GroupVersionResource, kind, listKind schema.GroupVersionKind) ResourceStorage {
+func NewStorage(gvr schema.GroupVersionResource, client proxy.Client) ResourceStorage {
 	var storage ResourceStorage
-	storage.Resource = &REST{}
-	storage.Status = &StatusREST{}
+	storage.Resource = &REST{gvr: gvr, proxyClient: client}
+	storage.Status = &StatusREST{gvr: gvr, proxyClient: client}
 
 	return storage
 }
@@ -51,8 +51,6 @@ func NewStorage(resource schema.GroupVersionResource, kind, listKind schema.Grou
 // REST implements a RESTStorage for API services against etcd
 type REST struct {
 	gvr          schema.GroupVersionResource
-	kind         schema.GroupVersionKind
-	listKind     schema.GroupVersionKind
 	searchClient search.Client
 	proxyClient  proxy.Client
 }
@@ -69,7 +67,6 @@ var _ = rest.Lister(&REST{})
 
 func (s *REST) NewList() runtime.Object {
 	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(s.listKind)
 	return list
 }
 
@@ -175,7 +172,6 @@ var _ = rest.CreaterUpdater(&REST{})
 
 func (c *REST) New() runtime.Object {
 	obj := &unstructured.Unstructured{}
-	obj.SetGroupVersionKind(c.kind)
 	return obj
 }
 

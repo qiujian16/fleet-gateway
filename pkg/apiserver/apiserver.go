@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -55,10 +56,12 @@ func init() {
 
 type Config struct {
 	GenericConfig *genericapiserver.RecommendedConfig
+	ProxyClient   proxy.Client
 }
 
 type completedConfig struct {
 	GenericConfig genericapiserver.CompletedConfig
+	ProxyClient   proxy.Client
 }
 
 type CompletedConfig struct {
@@ -66,14 +69,15 @@ type CompletedConfig struct {
 	*completedConfig
 }
 
-type CustomResourceDefinitions struct {
+type Gateway struct {
 	GenericAPIServer *genericapiserver.GenericAPIServer
 }
 
 // Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
 func (cfg *Config) Complete() CompletedConfig {
 	c := completedConfig{
-		cfg.GenericConfig.Complete(),
+		GenericConfig: cfg.GenericConfig.Complete(),
+		ProxyClient:   cfg.ProxyClient,
 	}
 
 	c.GenericConfig.EnableDiscovery = false
@@ -82,20 +86,13 @@ func (cfg *Config) Complete() CompletedConfig {
 }
 
 // New returns a new instance of CustomResourceDefinitions from the given config.
-func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*Gateway, error) {
 	genericServer, err := c.GenericConfig.New("fleed-gateway-apiserver", delegationTarget)
 	if err != nil {
 		return nil, err
 	}
 
-	// hasCRDInformerSyncedSignal is closed when the CRD informer this server uses has been fully synchronized.
-	// It ensures that requests to potential custom resource endpoints while the server hasn't installed all known HTTP paths get a 503 error instead of a 404
-	hasCRDInformerSyncedSignal := make(chan struct{})
-	if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("CRDInformerHasNotSynced", hasCRDInformerSyncedSignal); err != nil {
-		return nil, err
-	}
-
-	s := &CustomResourceDefinitions{
+	s := &Gateway{
 		GenericAPIServer: genericServer,
 	}
 
@@ -112,11 +109,12 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		discovery: map[string]*discovery.APIGroupHandler{},
 		delegate:  delegateHandler,
 	}
-	crdHandler, err := NewResourceDefinitionHandler(
+	crdHandler, err := NewResourceHandler(
 		versionDiscoveryHandler,
 		groupDiscoveryHandler,
 		delegateHandler,
 		s.GenericAPIServer.Authorizer,
+		c.ProxyClient,
 		c.GenericConfig.RequestTimeout,
 		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
 		c.GenericConfig.MaxRequestBodyBytes,
@@ -134,7 +132,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	}
 	discoveryController := NewDiscoveryController(versionDiscoveryHandler, groupDiscoveryHandler, aggregatedDiscoveryManager)
 
-	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
+	s.GenericAPIServer.AddPostStartHookOrDie("start-fleet-gateway-controllers", func(context genericapiserver.PostStartHookContext) error {
 		discoverySyncedCh := make(chan struct{})
 		go discoveryController.Run(context.StopCh, discoverySyncedCh)
 		select {

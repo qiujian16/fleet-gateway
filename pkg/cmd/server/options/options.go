@@ -22,6 +22,7 @@ import (
 	"net"
 
 	"github.com/qiujian16/fleet-gateway/pkg/apiserver"
+	proxyoptions "github.com/qiujian16/fleet-gateway/pkg/client/proxy/options"
 	"github.com/spf13/pflag"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -35,7 +36,7 @@ const defaultEtcdPathPrefix = "/registry/apiextensions.kubernetes.io"
 type GatewayServerOptions struct {
 	ServerRunOptions   *genericoptions.ServerRunOptions
 	RecommendedOptions *genericoptions.RecommendedOptions
-	APIEnablement      *genericoptions.APIEnablementOptions
+	ProxyClientOption  *proxyoptions.ProxyOption
 
 	StdOut io.Writer
 	StdErr io.Writer
@@ -45,10 +46,13 @@ type GatewayServerOptions struct {
 func NewGatewayServerOptions(out, errOut io.Writer) *GatewayServerOptions {
 	o := &GatewayServerOptions{
 		ServerRunOptions: genericoptions.NewServerRunOptions(),
-		APIEnablement:    genericoptions.NewAPIEnablementOptions(),
-
-		StdOut: out,
-		StdErr: errOut,
+		RecommendedOptions: genericoptions.NewRecommendedOptions(
+			defaultEtcdPathPrefix,
+			apiserver.Codecs.LegacyCodec(),
+		),
+		ProxyClientOption: proxyoptions.NewProxyOption(),
+		StdOut:            out,
+		StdErr:            errOut,
 	}
 
 	return o
@@ -58,7 +62,7 @@ func NewGatewayServerOptions(out, errOut io.Writer) *GatewayServerOptions {
 func (o GatewayServerOptions) AddFlags(fs *pflag.FlagSet) {
 	o.ServerRunOptions.AddUniversalFlags(fs)
 	o.RecommendedOptions.AddFlags(fs)
-	o.APIEnablement.AddFlags(fs)
+	o.ProxyClientOption.AddFlags(fs)
 }
 
 // Validate validates the apiextensions-apiserver options.
@@ -66,7 +70,6 @@ func (o GatewayServerOptions) Validate() error {
 	errors := []error{}
 	errors = append(errors, o.ServerRunOptions.Validate()...)
 	errors = append(errors, o.RecommendedOptions.Validate()...)
-	errors = append(errors, o.APIEnablement.Validate(apiserver.Scheme)...)
 	return utilerrors.NewAggregate(errors)
 }
 
@@ -87,9 +90,6 @@ func (o GatewayServerOptions) Config() (*apiserver.Config, error) {
 		return nil, err
 	}
 	if err := o.RecommendedOptions.ApplyTo(serverConfig); err != nil {
-		return nil, err
-	}
-	if err := o.APIEnablement.ApplyTo(&serverConfig.Config, apiserver.DefaultAPIResourceConfigSource(), apiserver.Scheme); err != nil {
 		return nil, err
 	}
 

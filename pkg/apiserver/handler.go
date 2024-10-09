@@ -25,10 +25,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	fleetresource "github.com/qiujian16/fleet-gateway/pkg/registry/resource"
 	"github.com/qiujian16/fleet-gateway/pkg/request"
 	"github.com/qiujian16/fleet-gateway/pkg/resourcescheme"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	structuraldefaulting "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/defaulting"
 	schemaobjectmeta "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/objectmeta"
@@ -45,7 +45,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
@@ -88,40 +87,30 @@ type resourceHandler struct {
 	// The limit on the request size that would be accepted and decoded in a write request
 	// 0 means no limit.
 	maxRequestBodyBytes int64
+
+	proxyClient proxy.Client
 }
 
 // resourceInfo stores enough information to serve the storage for the custom resource
 type resourceInfo struct {
-	Name         string
-	Singular     string
-	Kind         string
-	ListKind     string
-	Resource     string
-	Group        string
-	Scope        apiextensionsv1.ResourceScope
-	Versions     []string
-	SubResources sets.Set[string]
+	SubResources string
 
 	// Storage per version
-	storages map[string]fleetresource.ResourceStorage
+	storage fleetresource.ResourceStorage
 
 	// Request scope per version
-	requestScopes map[string]*handlers.RequestScope
-
-	// Status scope per version
-	statusRequestScopes map[string]*handlers.RequestScope
-
-	waitGroup *utilwaitgroup.SafeWaitGroup
+	requestScope *handlers.RequestScope
 }
 
 // resourcesStorageMap goes from resource to its storage
 type resourcesStorageMap map[string]*resourceInfo
 
-func NewResourceDefinitionHandler(
+func NewResourceHandler(
 	versionDiscoveryHandler *versionDiscoveryHandler,
 	groupDiscoveryHandler *groupDiscoveryHandler,
 	delegate http.Handler,
 	authorizer authorizer.Authorizer,
+	proxyClient proxy.Client,
 	requestTimeout time.Duration,
 	minRequestTimeout time.Duration,
 	maxRequestBodyBytes int64) (*resourceHandler, error) {
@@ -134,6 +123,7 @@ func NewResourceDefinitionHandler(
 		requestTimeout:          requestTimeout,
 		minRequestTimeout:       minRequestTimeout,
 		maxRequestBodyBytes:     maxRequestBodyBytes,
+		proxyClient:             proxyClient,
 	}
 
 	ret.resourceStorage.Store(resourcesStorageMap{})
@@ -168,11 +158,20 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// HACK: just a workaround for testing
 		cluster.Wildcard = true
 	} else {
-		cluster.Name = path
+		proxy, err := r.proxyClient.Proxy(path)
+		if err != nil {
+			responsewriters.ErrorNegotiated(
+				apierrors.NewBadRequest(err.Error()),
+				Codecs, schema.GroupVersion{}, w, req,
+			)
+			return
+		}
+
+		proxy.ServeHTTP(w, req)
+		return
 	}
 
-	ctx := request.WithCluster(req.Context(), cluster)
-	requestInfo, ok := apirequest.RequestInfoFrom(ctx)
+	requestInfo, ok := apirequest.RequestInfoFrom(req.Context())
 	if !ok {
 		responsewriters.ErrorNegotiated(
 			apierrors.NewInternalError(fmt.Errorf("no RequestInfo found in the context")),
@@ -198,29 +197,7 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	//TODO get resource info from search
-
-	// resourceName := requestInfo.Resource + "." + requestInfo.APIGroup
-	info := &resourceInfo{}
-
-	if apierrors.IsNotFound(err) {
-		r.delegate.ServeHTTP(w, req)
-		return
-	}
-	if err != nil {
-		utilruntime.HandleError(err)
-		responsewriters.ErrorNegotiated(
-			apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
-			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
-		)
-		return
-	}
-
-	resourceInfo, err := r.getOrCreateServingInfoFor(info.Name)
-	if apierrors.IsNotFound(err) {
-		r.delegate.ServeHTTP(w, req)
-		return
-	}
+	info, err := r.requestInfo(requestInfo)
 	if err != nil {
 		utilruntime.HandleError(err)
 		responsewriters.ErrorNegotiated(
@@ -242,8 +219,6 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	var handlerFunc http.HandlerFunc
 	switch {
-	case info.SubResources.Has("status"):
-		handlerFunc = r.serveStatus(w, req, requestInfo, resourceInfo, supportedTypes)
 	case len(subresource) == 0:
 		handlerFunc = r.serveResource(w, req, requestInfo, info, supportedTypes)
 	default:
@@ -255,76 +230,26 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if handlerFunc != nil {
 		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, false, "", handlerFunc)
-		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, resourceInfo.waitGroup)
-		handler.ServeHTTP(w, req.WithContext(ctx))
+		handler := genericfilters.WithHTTPLogging(handlerFunc)
+		handler.ServeHTTP(w, req)
 		return
 	}
 }
 
 func (r *resourceHandler) serveResource(w http.ResponseWriter, req *http.Request, requestInfo *apirequest.RequestInfo, info *resourceInfo, supportedTypes []string) http.HandlerFunc {
-	requestScope := info.requestScopes[requestInfo.APIVersion]
-	storage := info.storages[requestInfo.APIVersion].Resource
+	requestScope := info.requestScope
+	storage := info.storage.Resource
 
 	switch requestInfo.Verb {
-	case "get":
-		return handlers.GetResource(storage, requestScope)
 	case "list":
 		forceWatch := false
 		return handlers.ListResource(storage, storage, requestScope, forceWatch, r.minRequestTimeout)
-	case "create":
-		return handlers.CreateResource(storage, requestScope, nil)
-	case "update":
-		return handlers.UpdateResource(storage, requestScope, nil)
-	case "patch":
-		return handlers.PatchResource(storage, requestScope, nil, supportedTypes)
-	case "delete":
-		allowsOptions := true
-		return handlers.DeleteResource(storage, allowsOptions, requestScope, nil)
 	default:
 		responsewriters.ErrorNegotiated(
 			apierrors.NewMethodNotSupported(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Verb),
 			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
 		)
 		return nil
-	}
-}
-
-func (r *resourceHandler) serveStatus(w http.ResponseWriter, req *http.Request, requestInfo *apirequest.RequestInfo, info *resourceInfo, supportedTypes []string) http.HandlerFunc {
-	requestScope := info.statusRequestScopes[requestInfo.APIVersion]
-	storage := info.storages[requestInfo.APIVersion].Status
-
-	switch requestInfo.Verb {
-	case "get":
-		return handlers.GetResource(storage, requestScope)
-	case "update":
-		return handlers.UpdateResource(storage, requestScope, nil)
-	case "patch":
-		return handlers.PatchResource(storage, requestScope, nil, supportedTypes)
-	default:
-		responsewriters.ErrorNegotiated(
-			apierrors.NewMethodNotSupported(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Verb),
-			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
-		)
-		return nil
-	}
-}
-
-// removeStorage_locked removes the cached storage with the given uid as key from the storage map. This function
-// updates r.customStorage with the cleaned-up storageMap and tears down the old storage.
-// NOTE: Caller MUST hold r.customStorageLock to write r.customStorage thread-safely.
-func (r *resourceHandler) removeStorage_locked(name string) {
-	storageMap := r.resourceStorage.Load().(resourcesStorageMap)
-	if oldInfo, ok := storageMap[name]; ok {
-		// Copy because we cannot write to storageMap without a race
-		// as it is used without locking elsewhere.
-		storageMap2 := storageMap.clone()
-
-		// Remove from the CRD info map and store the map
-		delete(storageMap2, name)
-		r.resourceStorage.Store(storageMap2)
-
-		// Tear down the old storage
-		go r.tearDown(oldInfo)
 	}
 }
 
@@ -335,15 +260,126 @@ func (r *resourceHandler) tearDown(oldInfo *resourceInfo) {
 		defer close(requestsDrained)
 		// Allow time for in-flight requests with a handle to the old info to register themselves
 		time.Sleep(time.Second)
-		// Wait for in-flight requests to drain
-		oldInfo.waitGroup.Wait()
 	}()
 
 	select {
 	case <-time.After(r.requestTimeout * 2):
-		klog.Warningf("timeout waiting for requests to drain for %s/%s, tearing down storage", oldInfo.Group, oldInfo.Kind)
+		klog.Warningf("timeout waiting for requests to drain, tearing down storage")
 	case <-requestsDrained:
 	}
+}
+
+func (r *resourceHandler) requestInfo(requestInfo *apirequest.RequestInfo) (*resourceInfo, error) {
+	equivalentResourceRegistry := runtime.NewEquivalentResourceRegistry()
+
+	structuralSchemas := map[string]*structuralschema.Structural{}
+	// In addition to Unstructured objects (Custom Resources), we also may sometimes need to
+	// decode unversioned Options objects, so we delegate to parameterScheme for such types.
+	parameterScheme := runtime.NewScheme()
+	parameterScheme.AddUnversionedTypes(schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion},
+		&metav1.ListOptions{},
+		&metav1.GetOptions{},
+		&metav1.DeleteOptions{},
+	)
+	parameterCodec := runtime.NewParameterCodec(parameterScheme)
+
+	resource := schema.GroupVersionResource{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion, Resource: requestInfo.Resource}
+	if len(resource.Resource) == 0 {
+		return nil, fmt.Errorf("the server could not properly serve the resource")
+	}
+
+	typer := newUnstructuredObjectTyper(parameterScheme)
+	creator := unstructuredCreator{}
+
+	gvr := schema.GroupVersionResource{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion, Resource: requestInfo.Resource}
+	storage := fleetresource.NewStorage(gvr, r.proxyClient)
+
+	clusterScoped := len(requestInfo.Namespace) == 0
+
+	// CRDs explicitly do not support protobuf, but some objects returned by the API server do
+	negotiatedSerializer := unstructuredNegotiatedSerializer{
+		typer:                 typer,
+		creator:               creator,
+		structuralSchemas:     structuralSchemas,
+		preserveUnknownFields: false,
+		supportedMediaTypes: []runtime.SerializerInfo{
+			{
+				MediaType:        "application/json",
+				MediaTypeType:    "application",
+				MediaTypeSubType: "json",
+				EncodesAsText:    true,
+				Serializer:       json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{}),
+				PrettySerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{Pretty: true}),
+				StrictSerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{
+					Strict: true,
+				}),
+				StreamSerializer: &runtime.StreamSerializerInfo{
+					EncodesAsText: true,
+					Serializer:    json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{}),
+					Framer:        json.Framer,
+				},
+			},
+			{
+				MediaType:        "application/yaml",
+				MediaTypeType:    "application",
+				MediaTypeSubType: "yaml",
+				EncodesAsText:    true,
+				Serializer:       json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{Yaml: true}),
+				StrictSerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{
+					Yaml:   true,
+					Strict: true,
+				}),
+			},
+			{
+				MediaType:        "application/vnd.kubernetes.protobuf",
+				MediaTypeType:    "application",
+				MediaTypeSubType: "vnd.kubernetes.protobuf",
+				Serializer:       protobuf.NewSerializer(creator, typer),
+				StreamSerializer: &runtime.StreamSerializerInfo{
+					Serializer: protobuf.NewRawSerializer(creator, typer),
+					Framer:     protobuf.LengthDelimitedFramer,
+				},
+			},
+		},
+	}
+	var standardSerializers []runtime.SerializerInfo
+	for _, s := range negotiatedSerializer.SupportedMediaTypes() {
+		if s.MediaType == runtime.ContentTypeProtobuf {
+			continue
+		}
+		standardSerializers = append(standardSerializers, s)
+	}
+
+	reqScope := &handlers.RequestScope{
+		Namer: handlers.ContextBasedNaming{
+			Namer:         meta.NewAccessor(),
+			ClusterScoped: clusterScoped,
+		},
+		Serializer:          negotiatedSerializer,
+		ParameterCodec:      parameterCodec,
+		StandardSerializers: standardSerializers,
+
+		Creater: creator,
+		Typer:   typer,
+
+		EquivalentResourceMapper: equivalentResourceRegistry,
+
+		Resource: schema.GroupVersionResource{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion, Resource: requestInfo.Resource},
+
+		MetaGroupVersion: metav1.SchemeGroupVersion,
+
+		TableConvertor: storage.Resource,
+
+		Authorizer: r.authorizer,
+
+		MaxRequestBodyBytes: r.maxRequestBodyBytes,
+	}
+
+	return &resourceInfo{
+		requestScope: reqScope,
+		storage:      storage,
+		SubResources: requestInfo.Subresource,
+	}, nil
 }
 
 // Destroy shuts down storage layer for all registered CRDs.
@@ -351,195 +387,6 @@ func (r *resourceHandler) tearDown(oldInfo *resourceInfo) {
 func (r *resourceHandler) destroy() {
 	r.customStorageLock.Lock()
 	defer r.customStorageLock.Unlock()
-}
-
-// getOrCreateServingInfoFor gets the CRD serving info for the given CRD UID if the key exists in the storage map.
-// Otherwise the function fetches the up-to-date CRD using the given CRD name and creates CRD serving info.
-func (r *resourceHandler) getOrCreateServingInfoFor(name string) (*resourceInfo, error) {
-	storageMap := r.resourceStorage.Load().(resourcesStorageMap)
-	if ret, ok := storageMap[name]; ok {
-		return ret, nil
-	}
-
-	r.customStorageLock.Lock()
-	defer r.customStorageLock.Unlock()
-
-	// Get the up-to-date CRD when we have the lock, to avoid racing with updateCustomResourceDefinition.
-	// If updateCustomResourceDefinition sees an update and happens later, the storage will be deleted and
-	// we will re-create the updated storage on demand. If updateCustomResourceDefinition happens before,
-	// we make sure that we observe the same up-to-date CRD.
-
-	// TODO get info from search
-	var info *resourceInfo
-
-	storageMap = r.resourceStorage.Load().(resourcesStorageMap)
-	if ret, ok := storageMap[name]; ok {
-		return ret, nil
-	}
-
-	// Scope/Storages per version.
-	requestScopes := map[string]*handlers.RequestScope{}
-	storages := map[string]fleetresource.ResourceStorage{}
-	statusScopes := map[string]*handlers.RequestScope{}
-
-	equivalentResourceRegistry := runtime.NewEquivalentResourceRegistry()
-
-	structuralSchemas := map[string]*structuralschema.Structural{}
-	for _, v := range info.Versions {
-		// In addition to Unstructured objects (Custom Resources), we also may sometimes need to
-		// decode unversioned Options objects, so we delegate to parameterScheme for such types.
-		parameterScheme := runtime.NewScheme()
-		parameterScheme.AddUnversionedTypes(schema.GroupVersion{Group: info.Group, Version: v},
-			&metav1.ListOptions{},
-			&metav1.GetOptions{},
-			&metav1.DeleteOptions{},
-		)
-		parameterCodec := runtime.NewParameterCodec(parameterScheme)
-
-		resource := schema.GroupVersionResource{Group: info.Group, Version: v, Resource: info.Resource}
-		if len(resource.Resource) == 0 {
-			utilruntime.HandleError(fmt.Errorf("CustomResourceDefinition %s has unexpected empty status.acceptedNames.plural", info.Name))
-			return nil, fmt.Errorf("the server could not properly serve the resource")
-		}
-		singularResource := schema.GroupVersionResource{Group: info.Group, Version: v, Resource: info.Resource}
-		if len(singularResource.Resource) == 0 {
-			utilruntime.HandleError(fmt.Errorf("CustomResourceDefinition %s has unexpected empty status.acceptedNames.singular", info.Name))
-			return nil, fmt.Errorf("the server could not properly serve the resource")
-		}
-		kind := schema.GroupVersionKind{Group: info.Group, Version: v, Kind: info.Kind}
-		if len(kind.Kind) == 0 {
-			utilruntime.HandleError(fmt.Errorf("CustomResourceDefinition %s has unexpected empty status.acceptedNames.kind", info.Name))
-			return nil, fmt.Errorf("the server could not properly serve the kind")
-		}
-		equivalentResourceRegistry.RegisterKindFor(resource, "", kind)
-
-		typer := newUnstructuredObjectTyper(parameterScheme)
-		creator := unstructuredCreator{}
-
-		listKind := schema.GroupVersionKind{Group: info.Group, Version: v, Kind: info.ListKind}
-		if len(listKind.Kind) == 0 {
-			utilruntime.HandleError(fmt.Errorf("CustomResourceDefinition %s has unexpected empty status.acceptedNames.listKind", info.Name))
-			return nil, fmt.Errorf("the server could not properly serve the list kind")
-		}
-
-		gvr := schema.GroupVersionResource{Group: info.Group, Version: v, Resource: info.Resource}
-
-		storages[v] = fleetresource.NewStorage(
-			gvr,
-			kind,
-			listKind,
-		)
-
-		clusterScoped := info.Scope == apiextensionsv1.ClusterScoped
-
-		// CRDs explicitly do not support protobuf, but some objects returned by the API server do
-		negotiatedSerializer := unstructuredNegotiatedSerializer{
-			typer:                 typer,
-			creator:               creator,
-			structuralSchemas:     structuralSchemas,
-			structuralSchemaGK:    kind.GroupKind(),
-			preserveUnknownFields: false,
-			supportedMediaTypes: []runtime.SerializerInfo{
-				{
-					MediaType:        "application/json",
-					MediaTypeType:    "application",
-					MediaTypeSubType: "json",
-					EncodesAsText:    true,
-					Serializer:       json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{}),
-					PrettySerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{Pretty: true}),
-					StrictSerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{
-						Strict: true,
-					}),
-					StreamSerializer: &runtime.StreamSerializerInfo{
-						EncodesAsText: true,
-						Serializer:    json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{}),
-						Framer:        json.Framer,
-					},
-				},
-				{
-					MediaType:        "application/yaml",
-					MediaTypeType:    "application",
-					MediaTypeSubType: "yaml",
-					EncodesAsText:    true,
-					Serializer:       json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{Yaml: true}),
-					StrictSerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, creator, typer, json.SerializerOptions{
-						Yaml:   true,
-						Strict: true,
-					}),
-				},
-				{
-					MediaType:        "application/vnd.kubernetes.protobuf",
-					MediaTypeType:    "application",
-					MediaTypeSubType: "vnd.kubernetes.protobuf",
-					Serializer:       protobuf.NewSerializer(creator, typer),
-					StreamSerializer: &runtime.StreamSerializerInfo{
-						Serializer: protobuf.NewRawSerializer(creator, typer),
-						Framer:     protobuf.LengthDelimitedFramer,
-					},
-				},
-			},
-		}
-		var standardSerializers []runtime.SerializerInfo
-		for _, s := range negotiatedSerializer.SupportedMediaTypes() {
-			if s.MediaType == runtime.ContentTypeProtobuf {
-				continue
-			}
-			standardSerializers = append(standardSerializers, s)
-		}
-
-		reqScope := handlers.RequestScope{
-			Namer: handlers.ContextBasedNaming{
-				Namer:         meta.NewAccessor(),
-				ClusterScoped: clusterScoped,
-			},
-			Serializer:          negotiatedSerializer,
-			ParameterCodec:      parameterCodec,
-			StandardSerializers: standardSerializers,
-
-			Creater:   creator,
-			Defaulter: unstructuredDefaulter{parameterScheme, structuralSchemas, kind.GroupKind()},
-			Typer:     typer,
-
-			EquivalentResourceMapper: equivalentResourceRegistry,
-
-			Resource: schema.GroupVersionResource{Group: info.Group, Version: v, Resource: info.Resource},
-			Kind:     kind,
-
-			// a handler for a specific group-version of a custom resource uses that version as the in-memory representation
-			HubGroupVersion: kind.GroupVersion(),
-
-			MetaGroupVersion: metav1.SchemeGroupVersion,
-
-			TableConvertor: storages[v].Resource,
-
-			Authorizer: r.authorizer,
-
-			MaxRequestBodyBytes: r.maxRequestBodyBytes,
-		}
-		requestScopes[v] = &reqScope
-	}
-
-	ret := &resourceInfo{
-		Name:                info.Name,
-		Group:               info.Group,
-		Versions:            info.Versions,
-		Kind:                info.Kind,
-		Resource:            info.Resource,
-		Scope:               info.Scope,
-		storages:            storages,
-		requestScopes:       requestScopes,
-		statusRequestScopes: statusScopes,
-		waitGroup:           &utilwaitgroup.SafeWaitGroup{},
-	}
-
-	// Copy because we cannot write to storageMap without a race
-	// as it is used without locking elsewhere.
-	storageMap2 := storageMap.clone()
-
-	storageMap2[info.Name] = ret
-	r.resourceStorage.Store(storageMap2)
-
-	return ret, nil
 }
 
 type unstructuredNegotiatedSerializer struct {
