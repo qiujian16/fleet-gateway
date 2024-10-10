@@ -40,9 +40,9 @@ type ResourceStorage struct {
 	Status   *StatusREST
 }
 
-func NewStorage(gvr schema.GroupVersionResource, client proxy.Client) ResourceStorage {
+func NewStorage(gvr schema.GroupVersionResource, client proxy.Client, seachClient search.Client) ResourceStorage {
 	var storage ResourceStorage
-	storage.Resource = &REST{gvr: gvr, proxyClient: client}
+	storage.Resource = &REST{gvr: gvr, proxyClient: client, searchClient: seachClient}
 	storage.Status = &StatusREST{gvr: gvr, proxyClient: client}
 
 	return storage
@@ -76,18 +76,7 @@ func (s *REST) List(ctx context.Context, options *metainternalversion.ListOption
 	if err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(options, &v1ListOptions, nil); err != nil {
 		return nil, err
 	}
-
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return s.searchClient.List(ctx, s.gvr, v1ListOptions)
-	}
-
-	client, err := s.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Resource(s.gvr).List(ctx, v1ListOptions)
+	return s.searchClient.List(ctx, s.gvr, v1ListOptions)
 }
 
 func (c *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {

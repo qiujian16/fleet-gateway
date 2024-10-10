@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
+	"github.com/qiujian16/fleet-gateway/pkg/client/search"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -57,11 +58,13 @@ func init() {
 type Config struct {
 	GenericConfig *genericapiserver.RecommendedConfig
 	ProxyClient   proxy.Client
+	SearchClient  search.Client
 }
 
 type completedConfig struct {
 	GenericConfig genericapiserver.CompletedConfig
 	ProxyClient   proxy.Client
+	SearchClient  search.Client
 }
 
 type CompletedConfig struct {
@@ -78,6 +81,7 @@ func (cfg *Config) Complete() CompletedConfig {
 	c := completedConfig{
 		GenericConfig: cfg.GenericConfig.Complete(),
 		ProxyClient:   cfg.ProxyClient,
+		SearchClient:  cfg.SearchClient,
 	}
 
 	c.GenericConfig.EnableDiscovery = false
@@ -115,6 +119,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		delegateHandler,
 		s.GenericAPIServer.Authorizer,
 		c.ProxyClient,
+		c.SearchClient,
 		c.GenericConfig.RequestTimeout,
 		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
 		c.GenericConfig.MaxRequestBodyBytes,
@@ -124,6 +129,8 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	}
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/api/", crdHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/clusters/", crdHandler)
 	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
 
 	aggregatedDiscoveryManager := genericServer.AggregatedDiscoveryGroupManager

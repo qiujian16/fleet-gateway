@@ -22,21 +22,26 @@ import (
 	"net"
 
 	"github.com/qiujian16/fleet-gateway/pkg/apiserver"
+	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	proxyoptions "github.com/qiujian16/fleet-gateway/pkg/client/proxy/options"
+	searchoptions "github.com/qiujian16/fleet-gateway/pkg/client/search/options"
 	"github.com/spf13/pflag"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/client-go/tools/clientcmd"
 	netutils "k8s.io/utils/net"
 )
-
-const defaultEtcdPathPrefix = "/registry/apiextensions.kubernetes.io"
 
 // CustomResourceDefinitionsServerOptions describes the runtime options of an apiextensions-apiserver.
 type GatewayServerOptions struct {
 	ServerRunOptions   *genericoptions.ServerRunOptions
-	RecommendedOptions *genericoptions.RecommendedOptions
+	SecureServing      *genericoptions.SecureServingOptionsWithLoopback
+	Authentication     *genericoptions.DelegatingAuthenticationOptions
+	Authorization      *genericoptions.DelegatingAuthorizationOptions
+	CoreAPI            *genericoptions.CoreAPIOptions
 	ProxyClientOption  *proxyoptions.ProxyOption
+	SearchClientOption *searchoptions.SearchOption
 
 	StdOut io.Writer
 	StdErr io.Writer
@@ -45,14 +50,15 @@ type GatewayServerOptions struct {
 // NewCustomResourceDefinitionsServerOptions creates default options of an apiextensions-apiserver.
 func NewGatewayServerOptions(out, errOut io.Writer) *GatewayServerOptions {
 	o := &GatewayServerOptions{
-		ServerRunOptions: genericoptions.NewServerRunOptions(),
-		RecommendedOptions: genericoptions.NewRecommendedOptions(
-			defaultEtcdPathPrefix,
-			apiserver.Codecs.LegacyCodec(),
-		),
-		ProxyClientOption: proxyoptions.NewProxyOption(),
-		StdOut:            out,
-		StdErr:            errOut,
+		ServerRunOptions:   genericoptions.NewServerRunOptions(),
+		SecureServing:      genericoptions.NewSecureServingOptions().WithLoopback(),
+		Authentication:     genericoptions.NewDelegatingAuthenticationOptions(),
+		Authorization:      genericoptions.NewDelegatingAuthorizationOptions(),
+		CoreAPI:            genericoptions.NewCoreAPIOptions(),
+		ProxyClientOption:  proxyoptions.NewProxyOption(),
+		SearchClientOption: searchoptions.NewSearchOptions(),
+		StdOut:             out,
+		StdErr:             errOut,
 	}
 
 	return o
@@ -61,15 +67,18 @@ func NewGatewayServerOptions(out, errOut io.Writer) *GatewayServerOptions {
 // AddFlags adds the apiextensions-apiserver flags to the flagset.
 func (o GatewayServerOptions) AddFlags(fs *pflag.FlagSet) {
 	o.ServerRunOptions.AddUniversalFlags(fs)
-	o.RecommendedOptions.AddFlags(fs)
+	o.SecureServing.AddFlags(fs)
+	o.Authorization.AddFlags(fs)
+	o.Authentication.AddFlags(fs)
+	o.CoreAPI.AddFlags(fs)
 	o.ProxyClientOption.AddFlags(fs)
+	o.SearchClientOption.AddFlags(fs)
 }
 
 // Validate validates the apiextensions-apiserver options.
 func (o GatewayServerOptions) Validate() error {
 	errors := []error{}
 	errors = append(errors, o.ServerRunOptions.Validate()...)
-	errors = append(errors, o.RecommendedOptions.Validate()...)
 	return utilerrors.NewAggregate(errors)
 }
 
@@ -81,7 +90,7 @@ func (o *GatewayServerOptions) Complete() error {
 // Config returns an apiextensions-apiserver configuration.
 func (o GatewayServerOptions) Config() (*apiserver.Config, error) {
 	// TODO have a "real" external address
-	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
+	if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
 		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
 
@@ -89,12 +98,27 @@ func (o GatewayServerOptions) Config() (*apiserver.Config, error) {
 	if err := o.ServerRunOptions.ApplyTo(&serverConfig.Config); err != nil {
 		return nil, err
 	}
-	if err := o.RecommendedOptions.ApplyTo(serverConfig); err != nil {
+	if err := o.SecureServing.ApplyTo(&serverConfig.Config.SecureServing, &serverConfig.Config.LoopbackClientConfig); err != nil {
+		return nil, err
+	}
+	if err := o.Authentication.ApplyTo(&serverConfig.Config.Authentication, serverConfig.SecureServing, serverConfig.OpenAPIConfig); err != nil {
+		return nil, err
+	}
+	if err := o.Authorization.ApplyTo(&serverConfig.Config.Authorization); err != nil {
+		return nil, err
+	}
+	if err := o.CoreAPI.ApplyTo(serverConfig); err != nil {
+		return nil, err
+	}
+
+	cfg, err := clientcmd.BuildConfigFromFlags("", o.CoreAPI.CoreAPIKubeconfigPath)
+	if err != nil {
 		return nil, err
 	}
 
 	config := &apiserver.Config{
 		GenericConfig: serverConfig,
+		ProxyClient:   proxy.NewClient(o.ProxyClientOption, cfg),
 	}
 	return config, nil
 }

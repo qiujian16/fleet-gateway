@@ -19,13 +19,13 @@ package apiserver
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
+	"github.com/qiujian16/fleet-gateway/pkg/client/search"
 	fleetresource "github.com/qiujian16/fleet-gateway/pkg/registry/resource"
 	"github.com/qiujian16/fleet-gateway/pkg/request"
 	"github.com/qiujian16/fleet-gateway/pkg/resourcescheme"
@@ -45,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
@@ -89,6 +90,7 @@ type resourceHandler struct {
 	maxRequestBodyBytes int64
 
 	proxyClient proxy.Client
+	seachClient search.Client
 }
 
 // resourceInfo stores enough information to serve the storage for the custom resource
@@ -100,6 +102,8 @@ type resourceInfo struct {
 
 	// Request scope per version
 	requestScope *handlers.RequestScope
+
+	waitGroup *utilwaitgroup.SafeWaitGroup
 }
 
 // resourcesStorageMap goes from resource to its storage
@@ -111,6 +115,7 @@ func NewResourceHandler(
 	delegate http.Handler,
 	authorizer authorizer.Authorizer,
 	proxyClient proxy.Client,
+	searchClient search.Client,
 	requestTimeout time.Duration,
 	minRequestTimeout time.Duration,
 	maxRequestBodyBytes int64) (*resourceHandler, error) {
@@ -124,6 +129,7 @@ func NewResourceHandler(
 		minRequestTimeout:       minRequestTimeout,
 		maxRequestBodyBytes:     maxRequestBodyBytes,
 		proxyClient:             proxyClient,
+		seachClient:             searchClient,
 	}
 
 	ret.resourceStorage.Store(resourcesStorageMap{})
@@ -141,7 +147,7 @@ var longRunningFilter = genericfilters.BasicLongRunningRequestCheck(sets.NewStri
 var possiblyAcrossAllNamespacesVerbs = sets.NewString("list", "watch")
 
 func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	path, newURL, found, err := ClusterPathFromAndStrip(req)
+	path, newURL, err := ClusterPathFromAndStrip(req)
 	if err != nil {
 		responsewriters.ErrorNegotiated(
 			apierrors.NewBadRequest(err.Error()),
@@ -149,16 +155,13 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		)
 		return
 	}
-	if found {
-		req.URL = newURL
-	}
 
 	var cluster request.Cluster
 	if len(path) == 0 {
 		// HACK: just a workaround for testing
 		cluster.Wildcard = true
 	} else {
-		proxy, err := r.proxyClient.Proxy(path)
+		err := r.proxyClient.Proxy(path, newURL, w, req)
 		if err != nil {
 			responsewriters.ErrorNegotiated(
 				apierrors.NewBadRequest(err.Error()),
@@ -166,8 +169,6 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			)
 			return
 		}
-
-		proxy.ServeHTTP(w, req)
 		return
 	}
 
@@ -230,7 +231,7 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if handlerFunc != nil {
 		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, false, "", handlerFunc)
-		handler := genericfilters.WithHTTPLogging(handlerFunc)
+		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, info.waitGroup)
 		handler.ServeHTTP(w, req)
 		return
 	}
@@ -292,7 +293,7 @@ func (r *resourceHandler) requestInfo(requestInfo *apirequest.RequestInfo) (*res
 	creator := unstructuredCreator{}
 
 	gvr := schema.GroupVersionResource{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion, Resource: requestInfo.Resource}
-	storage := fleetresource.NewStorage(gvr, r.proxyClient)
+	storage := fleetresource.NewStorage(gvr, r.proxyClient, r.seachClient)
 
 	clusterScoped := len(requestInfo.Namespace) == 0
 
@@ -647,7 +648,7 @@ func (v *unstructuredSchemaCoercer) apply(u *unstructured.Unstructured) (unknown
 
 // ClusterPathFromAndStrip parses the request for a logical cluster path, returns it if found
 // and strips it from the request URL path.
-func ClusterPathFromAndStrip(req *http.Request) (string, *url.URL, bool, error) {
+func ClusterPathFromAndStrip(req *http.Request) (string, string, error) {
 	if reqPath := req.URL.Path; strings.HasPrefix(reqPath, "/clusters/") {
 		reqPath = strings.TrimPrefix(reqPath, "/clusters/")
 
@@ -656,14 +657,8 @@ func ClusterPathFromAndStrip(req *http.Request) (string, *url.URL, bool, error) 
 			reqPath += "/"
 			i = len(reqPath) - 1
 		}
-		path, reqPath := reqPath[:i], reqPath[i:]
-		req.URL.Path = reqPath
-		newURL, err := url.Parse(req.URL.String())
-		if err != nil {
-			return "", nil, false, fmt.Errorf("unable to resolve %s, err %w", req.URL.Path, err)
-		}
-		return path, newURL, true, nil
+		return reqPath[:i], reqPath[i:], nil
 	}
 
-	return "", req.URL, false, nil
+	return "", req.URL.Path, nil
 }
