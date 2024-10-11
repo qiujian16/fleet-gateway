@@ -180,6 +180,7 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		)
 		return
 	}
+	klog.Infof("request %v, %v, %v, %v", requestInfo.Path, requestInfo.IsResourceRequest, requestInfo.APIGroup, requestInfo.Resource)
 	if !requestInfo.IsResourceRequest {
 		pathParts := splitPath(requestInfo.Path)
 		// only match /apis/<group>/<version>
@@ -380,6 +381,7 @@ func (r *resourceHandler) requestInfo(requestInfo *apirequest.RequestInfo) (*res
 		requestScope: reqScope,
 		storage:      storage,
 		SubResources: requestInfo.Subresource,
+		waitGroup:    &utilwaitgroup.SafeWaitGroup{},
 	}, nil
 }
 

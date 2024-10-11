@@ -72,11 +72,15 @@ func (s *REST) NewList() runtime.Object {
 
 // List retrieves a list of managedCluster that match label.
 func (s *REST) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
-	var v1ListOptions metav1.ListOptions
-	if err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(options, &v1ListOptions, nil); err != nil {
+	v1ListOptions := &metav1.ListOptions{}
+	if err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(options, v1ListOptions, nil); err != nil {
 		return nil, err
 	}
-	return s.searchClient.List(ctx, s.gvr, v1ListOptions)
+	listOptions := metav1.ListOptions{}
+	if v1ListOptions != nil {
+		listOptions = *v1ListOptions
+	}
+	return s.searchClient.List(ctx, s.gvr, listOptions)
 }
 
 func (c *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {

@@ -24,6 +24,7 @@ import (
 	"github.com/qiujian16/fleet-gateway/pkg/apiserver"
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	proxyoptions "github.com/qiujian16/fleet-gateway/pkg/client/proxy/options"
+	"github.com/qiujian16/fleet-gateway/pkg/client/search"
 	searchoptions "github.com/qiujian16/fleet-gateway/pkg/client/search/options"
 	"github.com/spf13/pflag"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -119,6 +120,7 @@ func (o GatewayServerOptions) Config() (*apiserver.Config, error) {
 	config := &apiserver.Config{
 		GenericConfig: serverConfig,
 		ProxyClient:   proxy.NewClient(o.ProxyClientOption, cfg),
+		SearchClient:  search.NewSearchClient(o.SearchClientOption),
 	}
 	return config, nil
 }
