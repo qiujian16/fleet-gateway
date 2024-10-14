@@ -27,7 +27,6 @@ import (
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	"github.com/qiujian16/fleet-gateway/pkg/client/search"
 	fleetresource "github.com/qiujian16/fleet-gateway/pkg/registry/resource"
-	"github.com/qiujian16/fleet-gateway/pkg/request"
 	"github.com/qiujian16/fleet-gateway/pkg/resourcescheme"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	structuraldefaulting "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/defaulting"
@@ -156,11 +155,7 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var cluster request.Cluster
-	if len(path) == 0 {
-		// HACK: just a workaround for testing
-		cluster.Wildcard = true
-	} else {
+	if len(path) > 0 {
 		err := r.proxyClient.Proxy(path, newURL, w, req)
 		if err != nil {
 			responsewriters.ErrorNegotiated(
@@ -191,6 +186,15 @@ func (r *resourceHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		// only match /apis/<group>
 		if len(pathParts) == 2 {
+			if pathParts[0] == "apis" {
+				r.groupDiscoveryHandler.ServeHTTP(w, req)
+			} else {
+				r.versionDiscoveryHandler.ServeHTTP(w, req)
+			}
+			return
+		}
+
+		if len(pathParts) == 1 {
 			r.groupDiscoveryHandler.ServeHTTP(w, req)
 			return
 		}

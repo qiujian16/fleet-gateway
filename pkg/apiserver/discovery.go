@@ -21,8 +21,13 @@ import (
 	"strings"
 	"sync"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
+	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
+	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
+	"k8s.io/klog/v2"
 )
 
 type versionDiscoveryHandler struct {
@@ -35,6 +40,16 @@ type versionDiscoveryHandler struct {
 
 func (r *versionDiscoveryHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	pathParts := splitPath(req.URL.Path)
+	klog.Infof("version path is %v", pathParts)
+	if len(pathParts) == 2 && pathParts[0] == "api" {
+		discovery, ok := r.getDiscovery(schema.GroupVersion{Version: pathParts[1]})
+		if !ok {
+			r.delegate.ServeHTTP(w, req)
+			return
+		}
+		discovery.ServeHTTP(w, req)
+		return
+	}
 	// only match /apis/<group>/<version>
 	if len(pathParts) != 3 || pathParts[0] != "apis" {
 		r.delegate.ServeHTTP(w, req)
@@ -75,12 +90,23 @@ type groupDiscoveryHandler struct {
 	// TODO, writing is infrequent, optimize this
 	discoveryLock sync.RWMutex
 	discovery     map[string]*discovery.APIGroupHandler
+	serializer    runtime.NegotiatedSerializer
 
 	delegate http.Handler
 }
 
 func (r *groupDiscoveryHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	pathParts := splitPath(req.URL.Path)
+	klog.Infof("group path is %v", pathParts)
+	if len(pathParts) == 1 && pathParts[0] == "api" {
+		apiVersions := &metav1.APIVersions{
+			Versions: []string{"v1"},
+		}
+		responsewriters.WriteObjectNegotiated(
+			r.serializer, negotiation.DefaultEndpointRestrictions,
+			schema.GroupVersion{}, w, req, http.StatusOK, apiVersions, false)
+		return
+	}
 	// only match /apis/<group>
 	if len(pathParts) != 2 || pathParts[0] != "apis" {
 		r.delegate.ServeHTTP(w, req)

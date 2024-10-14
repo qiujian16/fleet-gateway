@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
-	"k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
 )
@@ -86,7 +85,7 @@ func (cfg *Config) Complete() CompletedConfig {
 		SearchClient:  cfg.SearchClient,
 	}
 
-	c.GenericConfig.EnableDiscovery = false
+	c.GenericConfig.EnableDiscovery = true
 
 	return CompletedConfig{&c}
 }
@@ -112,8 +111,9 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		delegate:  delegateHandler,
 	}
 	groupDiscoveryHandler := &groupDiscoveryHandler{
-		discovery: map[string]*discovery.APIGroupHandler{},
-		delegate:  delegateHandler,
+		discovery:  map[string]*discovery.APIGroupHandler{},
+		delegate:   delegateHandler,
+		serializer: s.GenericAPIServer.Serializer,
 	}
 	crdHandler, err := NewResourceHandler(
 		versionDiscoveryHandler,
@@ -129,24 +129,18 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	if err != nil {
 		return nil, err
 	}
-	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
+
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/api", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/api/", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/clusters/", crdHandler)
 	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
-
-	aggregatedDiscoveryManager := genericServer.AggregatedDiscoveryGroupManager
-	if aggregatedDiscoveryManager != nil {
-		aggregatedDiscoveryManager = aggregatedDiscoveryManager.WithSource(aggregated.CRDSource)
-	}
-	discoveryController := NewDiscoveryController(versionDiscoveryHandler, groupDiscoveryHandler, aggregatedDiscoveryManager)
+	discoveryController := NewDiscoveryController(versionDiscoveryHandler, groupDiscoveryHandler, s.GenericAPIServer.DiscoveryGroupManager, c.SearchClient)
 
 	s.GenericAPIServer.AddPostStartHookOrDie("start-fleet-gateway-controllers", func(context genericapiserver.PostStartHookContext) error {
-		discoverySyncedCh := make(chan struct{})
-		go discoveryController.Run(context.StopCh, discoverySyncedCh)
+		go discoveryController.Run(context.StopCh)
 		select {
 		case <-context.StopCh:
-		case <-discoverySyncedCh:
 		}
 
 		return nil

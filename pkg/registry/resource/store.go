@@ -22,7 +22,6 @@ import (
 
 	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	"github.com/qiujian16/fleet-gateway/pkg/client/search"
-	"github.com/qiujian16/fleet-gateway/pkg/request"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metatable "k8s.io/apimachinery/pkg/api/meta/table"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -37,13 +36,11 @@ import (
 // ResourceStorage includes dummy storage for CustomResources, and their Status and Scale subresources.
 type ResourceStorage struct {
 	Resource *REST
-	Status   *StatusREST
 }
 
 func NewStorage(gvr schema.GroupVersionResource, client proxy.Client, seachClient search.Client) ResourceStorage {
 	var storage ResourceStorage
 	storage.Resource = &REST{gvr: gvr, proxyClient: client, searchClient: seachClient}
-	storage.Status = &StatusREST{gvr: gvr, proxyClient: client}
 
 	return storage
 }
@@ -107,13 +104,9 @@ func (c *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableO
 	}
 	var err error
 	table.Rows, err = metatable.MetaToTableRow(object, func(obj runtime.Object, m metav1.Object, name, age string) ([]interface{}, error) {
-		cluster := request.ClusterFrom(ctx)
-		clusterName := cluster.Name
-		if cluster.Wildcard {
-			clusterName, err = getClusterFromMeta(obj)
-			if err != nil {
-				return nil, err
-			}
+		clusterName, err := getClusterFromMeta(obj)
+		if err != nil {
+			return nil, err
 		}
 
 		return []interface{}{clusterName, name, age}, nil
@@ -125,173 +118,11 @@ func (c *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableO
 	return table, nil
 }
 
-var _ = rest.Getter(&REST{})
-
-func (c *REST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, fmt.Errorf("should specify cluster")
-	}
-
-	client, err := c.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Resource(c.gvr).Get(ctx, name, *options)
-}
-
 var _ = rest.Watcher(&REST{})
 
 func (c *REST) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, fmt.Errorf("should specify cluster")
-	}
-	var v1ListOptions metav1.ListOptions
-	if err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(options, &v1ListOptions, nil); err != nil {
-		return nil, err
-	}
 
-	client, err := c.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Resource(c.gvr).Watch(ctx, v1ListOptions)
-}
-
-var _ = rest.CreaterUpdater(&REST{})
-
-func (c *REST) New() runtime.Object {
-	obj := &unstructured.Unstructured{}
-	return obj
-}
-
-func (c *REST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, fmt.Errorf("should specify cluster")
-	}
-
-	client, err := c.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Resource(c.gvr).Create(ctx, obj.(*unstructured.Unstructured), *options)
-}
-
-func (c *REST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, false, fmt.Errorf("should specify cluster")
-	}
-
-	obj, err := objInfo.UpdatedObject(ctx, nil)
-	if err != nil {
-		return nil, false, err
-	}
-
-	client, err := c.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, false, err
-	}
-
-	obj, err = client.Resource(c.gvr).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, false, err
-	}
-
-	unstructuredObject, err := objInfo.UpdatedObject(ctx, obj)
-	if err != nil {
-		return nil, false, err
-	}
-
-	updated, err := client.Resource(c.gvr).Update(ctx, unstructuredObject.(*unstructured.Unstructured), *options)
-	return updated, false, err
-}
-
-var _ = rest.GracefulDeleter(&REST{})
-
-func (c *REST) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, false, fmt.Errorf("should specify cluster")
-	}
-
-	client, err := c.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, false, err
-	}
-
-	obj, err := client.Resource(c.gvr).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, false, err
-	}
-
-	err = client.Resource(c.gvr).Delete(ctx, name, *options)
-	return obj, false, err
-}
-
-// StatusREST implements the REST endpoint for changing the status of a CustomResource
-type StatusREST struct {
-	gvr         schema.GroupVersionResource
-	proxyClient proxy.Client
-}
-
-var _ = rest.Patcher(&StatusREST{})
-
-func (r *StatusREST) New() runtime.Object {
-	return &unstructured.Unstructured{}
-}
-
-// Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, fmt.Errorf("should specify cluster")
-	}
-
-	client, err := r.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Resource(r.gvr).Get(ctx, name, *options)
-}
-
-// Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	cluster := request.ClusterFrom(ctx)
-	if cluster.Wildcard {
-		return nil, false, fmt.Errorf("should specify cluster")
-	}
-
-	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
-	// subresources should never allow create on update.
-	obj, err := objInfo.UpdatedObject(ctx, nil)
-	if err != nil {
-		return nil, false, err
-	}
-
-	client, err := r.proxyClient.DynamicClient(cluster.Name)
-	if err != nil {
-		return nil, false, err
-	}
-
-	obj, err = client.Resource(r.gvr).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, false, err
-	}
-
-	unstructuredObject, err := objInfo.UpdatedObject(ctx, obj)
-	if err != nil {
-		return nil, false, err
-	}
-
-	updated, err := client.Resource(r.gvr).UpdateStatus(ctx, unstructuredObject.(*unstructured.Unstructured), *options)
-	return updated, false, err
+	return nil, fmt.Errorf("watch is not supported")
 }
 
 const clusterLabelKey = "open-cluster-management/cluster"

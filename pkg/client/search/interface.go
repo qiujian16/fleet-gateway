@@ -10,6 +10,7 @@ import (
 	"github.com/machinebox/graphql"
 	"github.com/qiujian16/fleet-gateway/pkg/api"
 	"github.com/qiujian16/fleet-gateway/pkg/client/search/options"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -28,7 +29,7 @@ query searchResultItems($input: [SearchInput]) {
 type Client interface {
 	List(ctx context.Context, gvr schema.GroupVersionResource, listOptions metav1.ListOptions) (runtime.Object, error)
 
-	Resources() []api.ResourceInfo
+	Resources() map[schema.GroupVersion][]api.ResourceInfo
 
 	ResoursesFor(name string) api.ResourceInfo
 }
@@ -53,11 +54,13 @@ type SearchResult struct {
 }
 
 type Object struct {
-	Name       string `json:"name"`
-	Namespace  string `json:"namespace"`
-	Cluster    string `json:"cluster"`
-	APIVersion string `json:"apiversion"`
-	Kind       string `json:"kind"`
+	Name       string      `json:"name"`
+	Namespace  string      `json:"namespace"`
+	Cluster    string      `json:"cluster"`
+	APIGroup   string      `json:"apigroup"`
+	APIVersion string      `json:"apiversion"`
+	Kind       string      `json:"kind"`
+	Created    metav1.Time `json:"created"`
 }
 
 type searchClient struct {
@@ -84,11 +87,21 @@ func (s *searchClient) List(ctx context.Context, gvr schema.GroupVersionResource
 			Property: "kind_plural",
 			Values:   []string{gvr.Resource},
 		},
+		{
+			Property: "apiversion",
+			Values:   []string{gvr.Version},
+		},
 	}
-	if ok {
+	if ok && ns != "" {
 		filters = append(filters, Filter{
 			Property: "namespace",
 			Values:   []string{ns},
+		})
+	}
+	if gvr.Group != "" {
+		filters = append(filters, Filter{
+			Property: "apigroup",
+			Values:   []string{gvr.Group},
 		})
 	}
 	req := graphql.NewRequest(queryPattern)
@@ -100,6 +113,8 @@ func (s *searchClient) List(ctx context.Context, gvr schema.GroupVersionResource
 		},
 	}
 	req.Var("input", vars)
+	varStr, _ := json.Marshal(vars)
+	klog.Infof("search variable is %s", string(varStr))
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", s.token))
 
 	respData := ResultData{}
@@ -112,14 +127,19 @@ func (s *searchClient) List(ctx context.Context, gvr schema.GroupVersionResource
 	list := &metav1.PartialObjectMetadataList{}
 	for _, result := range respData.SearchResults {
 		for _, item := range result.Items {
+			apiVersion := item.APIGroup + "/" + item.APIVersion
+			if item.APIGroup == "" {
+				apiVersion = item.APIVersion
+			}
 			o := metav1.PartialObjectMetadata{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       item.Kind,
-					APIVersion: item.APIVersion,
+					APIVersion: apiVersion,
 				},
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      item.Name,
-					Namespace: item.Namespace,
+					Name:              item.Name,
+					Namespace:         item.Namespace,
+					CreationTimestamp: item.Created,
 					Labels: map[string]string{
 						"open-cluster-management/cluster": item.Cluster,
 					},
@@ -131,8 +151,48 @@ func (s *searchClient) List(ctx context.Context, gvr schema.GroupVersionResource
 	return list, nil
 }
 
-func (s *searchClient) Resources() []api.ResourceInfo {
-	return []api.ResourceInfo{}
+func (s *searchClient) Resources() map[schema.GroupVersion][]api.ResourceInfo {
+	return map[schema.GroupVersion][]api.ResourceInfo{
+		schema.GroupVersion{Group: "apps", Version: "v1"}: {
+			{
+				Name:     "deployments",
+				Singular: "deployment",
+				ListKind: "DeploymentList",
+				Kind:     "Deployment",
+				Scope:    apiextensionsv1.NamespaceScoped,
+			},
+		},
+		schema.GroupVersion{Version: "v1"}: {
+			{
+				Name:     "pods",
+				Singular: "pod",
+				ListKind: "PodList",
+				Kind:     "Pod",
+				Scope:    apiextensionsv1.NamespaceScoped,
+			},
+			{
+				Name:     "namespaces",
+				Singular: "namespace",
+				ListKind: "NamespaceList",
+				Kind:     "Namespace",
+				Scope:    apiextensionsv1.ClusterScoped,
+			},
+			{
+				Name:     "secrets",
+				Singular: "secret",
+				ListKind: "SecretList",
+				Kind:     "Secret",
+				Scope:    apiextensionsv1.NamespaceScoped,
+			},
+			{
+				Name:     "configmaps",
+				Singular: "configmap",
+				ListKind: "ConfigMapList",
+				Kind:     "ConfigMap",
+				Scope:    apiextensionsv1.NamespaceScoped,
+			},
+		},
+	}
 }
 
 func (s *searchClient) ResoursesFor(name string) api.ResourceInfo {
