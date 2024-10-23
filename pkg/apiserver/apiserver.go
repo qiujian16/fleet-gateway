@@ -135,7 +135,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/api/", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/clusters/", crdHandler)
 	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
-	discoveryController := NewDiscoveryController(versionDiscoveryHandler, groupDiscoveryHandler, s.GenericAPIServer.DiscoveryGroupManager, c.SearchClient)
+	discoveryController := NewDiscoveryController(versionDiscoveryHandler, groupDiscoveryHandler, s.GenericAPIServer.AggregatedDiscoveryGroupManager, c.SearchClient)
 
 	s.GenericAPIServer.AddPostStartHookOrDie("start-fleet-gateway-controllers", func(context genericapiserver.PostStartHookContext) error {
 		go discoveryController.Run(context.StopCh)

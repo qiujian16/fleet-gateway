@@ -20,10 +20,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/qiujian16/fleet-gateway/pkg/client/proxy"
 	"github.com/qiujian16/fleet-gateway/pkg/client/search"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metatable "k8s.io/apimachinery/pkg/api/meta/table"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -38,18 +36,18 @@ type ResourceStorage struct {
 	Resource *REST
 }
 
-func NewStorage(gvr schema.GroupVersionResource, client proxy.Client, seachClient search.Client) ResourceStorage {
+func NewStorage(gvr schema.GroupVersionResource, seachClient search.Client, tableConverter search.ConverterFunc) ResourceStorage {
 	var storage ResourceStorage
-	storage.Resource = &REST{gvr: gvr, proxyClient: client, searchClient: seachClient}
+	storage.Resource = &REST{gvr: gvr, searchClient: seachClient, tableConverter: tableConverter}
 
 	return storage
 }
 
 // REST implements a RESTStorage for API services against etcd
 type REST struct {
-	gvr          schema.GroupVersionResource
-	searchClient search.Client
-	proxyClient  proxy.Client
+	gvr            schema.GroupVersionResource
+	searchClient   search.Client
+	tableConverter search.ConverterFunc
 }
 
 // Implement CategoriesProvider
@@ -81,41 +79,7 @@ func (s *REST) List(ctx context.Context, options *metainternalversion.ListOption
 }
 
 func (c *REST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
-	headers := []metav1.TableColumnDefinition{
-		{Name: "Cluster", Type: "string", Format: "name", Description: "Cluster is the cluster of the resource."},
-		{Name: "Name", Type: "string", Format: "name", Description: "Name is the name of the resource."},
-		{Name: "Age", Type: "date", Description: "Age represents the age of the manifestworks until created."},
-	}
-	table := &metav1.Table{}
-	opt, ok := tableOptions.(*metav1.TableOptions)
-	noHeaders := ok && opt != nil && opt.NoHeaders
-	if !noHeaders {
-		table.ColumnDefinitions = headers
-	}
-
-	if m, err := meta.ListAccessor(object); err == nil {
-		table.ResourceVersion = m.GetResourceVersion()
-		table.Continue = m.GetContinue()
-		table.RemainingItemCount = m.GetRemainingItemCount()
-	} else {
-		if m, err := meta.CommonAccessor(object); err == nil {
-			table.ResourceVersion = m.GetResourceVersion()
-		}
-	}
-	var err error
-	table.Rows, err = metatable.MetaToTableRow(object, func(obj runtime.Object, m metav1.Object, name, age string) ([]interface{}, error) {
-		clusterName, err := getClusterFromMeta(obj)
-		if err != nil {
-			return nil, err
-		}
-
-		return []interface{}{clusterName, name, age}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return table, nil
+	return c.tableConverter(ctx, object, tableOptions)
 }
 
 var _ = rest.Watcher(&REST{})

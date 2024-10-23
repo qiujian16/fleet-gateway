@@ -12,6 +12,6 @@ func NewSearchOptions() *SearchOption {
 }
 
 func (p *SearchOption) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&p.SearchHost, "searh-host", p.SearchHost, "The host of the search api")
-	fs.StringVar(&p.Token, "searh-token", p.Token, "The token of the search api")
+	fs.StringVar(&p.SearchHost, "search-host", p.SearchHost, "The host of the search api")
+	fs.StringVar(&p.Token, "search-token", p.Token, "The token of the search api")
 }

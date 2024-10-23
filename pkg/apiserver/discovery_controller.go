@@ -17,6 +17,8 @@ limitations under the License.
 package apiserver
 
 import (
+	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
+	"k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
 	"sort"
 	"time"
 
@@ -33,14 +35,14 @@ import (
 type DiscoveryController struct {
 	versionHandler  *versionDiscoveryHandler
 	groupHandler    *groupDiscoveryHandler
-	resourceManager discovery.GroupManager
+	resourceManager aggregated.ResourceManager
 	searchClient    search.Client
 }
 
 func NewDiscoveryController(
 	versionHandler *versionDiscoveryHandler,
 	groupHandler *groupDiscoveryHandler,
-	resourceManager discovery.GroupManager,
+	resourceManager aggregated.ResourceManager,
 	searchClient search.Client,
 ) *DiscoveryController {
 	c := &DiscoveryController{
@@ -60,6 +62,7 @@ func (c *DiscoveryController) sync() {
 	for gv, resources := range resourceInfos {
 		apiVersionsForDiscovery := []metav1.GroupVersionForDiscovery{}
 		apiResourcesForDiscovery := []metav1.APIResource{}
+		aggregatedAPIResourcesForDiscovery := []apidiscoveryv2.APIResourceDiscovery{}
 		for _, resource := range resources {
 			groupVersion := gv.Group + "/" + gv.Version
 			if len(gv.Group) == 0 {
@@ -80,6 +83,28 @@ func (c *DiscoveryController) sync() {
 			c.versionHandler.setDiscovery(gv, discovery.NewAPIVersionHandler(Codecs, gv, discovery.APIResourceListerFunc(func() []metav1.APIResource {
 				return apiResourcesForDiscovery
 			})))
+
+			verbs := metav1.Verbs([]string{"list"})
+			if gv.Group != "" {
+				var scope apidiscoveryv2.ResourceScope
+				if resource.Scope == apiextensionsv1.NamespaceScoped {
+					scope = apidiscoveryv2.ScopeNamespace
+				} else {
+					scope = apidiscoveryv2.ScopeCluster
+				}
+				apiResourceDiscovery := apidiscoveryv2.APIResourceDiscovery{
+					Resource:         resource.Name,
+					SingularResource: resource.Singular,
+					Scope:            scope,
+					ResponseKind: &metav1.GroupVersionKind{
+						Group:   gv.Group,
+						Version: gv.Version,
+						Kind:    resource.Kind,
+					},
+					Verbs: verbs,
+				}
+				aggregatedAPIResourcesForDiscovery = append(aggregatedAPIResourcesForDiscovery, apiResourceDiscovery)
+			}
 		}
 
 		sortGroupDiscoveryByKubeAwareVersion(apiVersionsForDiscovery)
@@ -94,7 +119,11 @@ func (c *DiscoveryController) sync() {
 		c.groupHandler.setDiscovery(gv.Group, discovery.NewAPIGroupHandler(Codecs, apiGroup))
 		if c.resourceManager != nil {
 			if gv.Group != "" {
-				c.resourceManager.AddGroup(apiGroup)
+				c.resourceManager.AddGroupVersion(gv.Group, apidiscoveryv2.APIVersionDiscovery{
+					Freshness: apidiscoveryv2.DiscoveryFreshnessCurrent,
+					Version:   gv.Version,
+					Resources: aggregatedAPIResourcesForDiscovery,
+				})
 			}
 		}
 	}

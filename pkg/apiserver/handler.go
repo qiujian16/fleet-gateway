@@ -298,7 +298,7 @@ func (r *resourceHandler) requestInfo(requestInfo *apirequest.RequestInfo) (*res
 	creator := unstructuredCreator{}
 
 	gvr := schema.GroupVersionResource{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion, Resource: requestInfo.Resource}
-	storage := fleetresource.NewStorage(gvr, r.proxyClient, r.seachClient)
+	storage := fleetresource.NewStorage(gvr, r.seachClient, r.seachClient.PrinterfFor(gvr))
 
 	clusterScoped := len(requestInfo.Namespace) == 0
 
